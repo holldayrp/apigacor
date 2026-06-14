@@ -1003,3 +1003,452 @@ async def _check_fb_checkpoint(em: str) -> str:
             return "error"
     except:
         return "error"
+
+@app.post("/fb/check/bulk", tags=["FB Checkpoint"], summary="Cek banyak email sekaligus ke Facebook")
+async def fb_check_bulk(emails: List[str], _=Depends(verify_api_key)):
+    """
+    Kirim list email, semua dicek ke Facebook sekaligus.
+    Contoh body: ["abc@domain.com", "xyz@domain.com"]
+    """
+    if not emails:
+        raise HTTPException(status_code=400, detail="List email kosong")
+    if len(emails) > 50:
+        raise HTTPException(status_code=400, detail="Maksimal 50 email per request")
+
+    labels = {
+        "ok":         "Email aman",
+        "checkpoint": "Kena checkpoint/suspicious",
+        "used":       "Sudah terdaftar di Facebook",
+        "error":      "Gagal cek",
+    }
+    results = []
+    with db() as conn:
+        for em in emails:
+            em = em.strip().lower()
+            result = await _check_fb_checkpoint(em)
+            conn.execute(
+                "INSERT INTO fb_checkpoint_log (email,status,checked_at) VALUES (?,?,?)",
+                (em, result, now_wib_str())
+            )
+            results.append({"email": em, "status": result, "description": labels.get(result, "")})
+            await asyncio.sleep(0.5)  # throttle agar tidak diblok FB
+        conn.commit()
+
+    summary = {"ok": 0, "checkpoint": 0, "used": 0, "error": 0}
+    for r in results:
+        summary[r["status"]] = summary.get(r["status"], 0) + 1
+
+    return {"total": len(results), "summary": summary, "results": results}
+
+@app.get("/fb/check/bulk/user/{user_id}", tags=["FB Checkpoint"], summary="Cek semua email aktif milik user")
+async def fb_check_bulk_user(user_id: int, _=Depends(verify_api_key)):
+    """Cek semua email aktif dalam sesi user ke Facebook."""
+    emails = user_emails.get(user_id, [])
+    if not emails:
+        raise HTTPException(status_code=404, detail="Tidak ada email aktif untuk user ini")
+
+    labels = {
+        "ok":         "Email aman",
+        "checkpoint": "Kena checkpoint/suspicious",
+        "used":       "Sudah terdaftar di Facebook",
+        "error":      "Gagal cek",
+    }
+    results = []
+    with db() as conn:
+        for em in emails:
+            result = await _check_fb_checkpoint(em.lower())
+            conn.execute(
+                "INSERT INTO fb_checkpoint_log (email,status,checked_at) VALUES (?,?,?)",
+                (em.lower(), result, now_wib_str())
+            )
+            results.append({"email": em, "status": result, "description": labels.get(result, "")})
+            await asyncio.sleep(0.5)
+        conn.commit()
+
+    summary = {"ok": 0, "checkpoint": 0, "used": 0, "error": 0}
+    for r in results:
+        summary[r["status"]] = summary.get(r["status"], 0) + 1
+
+    return {"user_id": user_id, "total": len(results), "summary": summary, "results": results}
+
+@app.get("/fb/log", tags=["FB Checkpoint"], summary="Log history FB checkpoint")
+def fb_log(
+    limit:  int = Query(50, ge=1, le=500),
+    status: Optional[str] = Query(None, description="Filter: ok/checkpoint/used/error"),
+    _=Depends(admin_only)
+):
+    with db() as conn:
+        if status:
+            rows = conn.execute(
+                "SELECT email, status, checked_at FROM fb_checkpoint_log "
+                "WHERE status=? ORDER BY checked_at DESC LIMIT ?",
+                (status.lower(), limit)
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT email, status, checked_at FROM fb_checkpoint_log "
+                "ORDER BY checked_at DESC LIMIT ?",
+                (limit,)
+            ).fetchall()
+    return [{"email": r[0], "status": r[1], "checked_at": r[2]} for r in rows]
+
+
+# ============================================================
+# ROUTES — GROUP CONFIG
+# ============================================================
+
+class SetGroupRequest(BaseModel):
+    group_id:   int = Field(..., description="Telegram group/channel ID (angka negatif untuk grup)")
+    group_link: str = Field(..., description="Link grup, contoh: https://t.me/namagrup atau @namagrup")
+
+@app.get("/group/config", tags=["Group"], summary="Lihat konfigurasi grup saat ini")
+def get_group_config(_=Depends(admin_only)):
+    with db() as conn:
+        gid  = conn.execute("SELECT value FROM bot_stats WHERE key='required_group_id'").fetchone()
+        link = conn.execute("SELECT value FROM bot_stats WHERE key='required_group_link'").fetchone()
+    group_id   = gid[0] if gid and gid[0] else None
+    group_link = link[0] if link and link[0] else ""
+    return {
+        "group_id":       group_id,
+        "group_link":     group_link,
+        "is_active":      bool(group_id and group_id != ""),
+    }
+
+@app.post("/group/config", tags=["Group"], summary="Set grup wajib join")
+def set_group_config(req: SetGroupRequest, _=Depends(admin_only)):
+    link = req.group_link.strip()
+    if not link.startswith("http") and not link.startswith("@"):
+        link = f"@{link}"
+    with db() as conn:
+        conn.execute("UPDATE bot_stats SET value=? WHERE key='required_group_id'", (str(req.group_id),))
+        conn.execute("UPDATE bot_stats SET value=? WHERE key='required_group_link'", (link,))
+        conn.commit()
+    return {"success": True, "group_id": req.group_id, "group_link": link}
+
+@app.delete("/group/config", tags=["Group"], summary="Hapus syarat wajib join grup")
+def delete_group_config(_=Depends(admin_only)):
+    with db() as conn:
+        conn.execute("UPDATE bot_stats SET value='' WHERE key='required_group_id'")
+        conn.execute("UPDATE bot_stats SET value='' WHERE key='required_group_link'")
+        conn.commit()
+    return {"success": True, "message": "Syarat grup dihapus, bot bebas dipakai siapa saja"}
+
+
+# ============================================================
+# ROUTES — BROADCAST (Kirim pesan via Telegram Bot API)
+# ============================================================
+
+class BroadcastTextRequest(BaseModel):
+    message:     str  = Field(..., description="Teks pesan (Markdown supported)")
+    parse_mode:  str  = Field("Markdown", description="Markdown atau HTML")
+    target_ids:  Optional[List[int]] = Field(None, description="Kirim ke user tertentu saja. Kosong = semua user")
+
+@app.post("/broadcast/text", tags=["Broadcast"], summary="Kirim pesan teks ke semua / sebagian user")
+async def broadcast_text(req: BroadcastTextRequest, _=Depends(admin_only)):
+    """
+    Kirim pesan teks via Telegram Bot API langsung.
+    - `target_ids` kosong → kirim ke semua user di database
+    - `target_ids` diisi → kirim hanya ke user yang disebutkan
+    """
+    targets = req.target_ids if req.target_ids else get_all_user_ids()
+    if not targets:
+        raise HTTPException(status_code=404, detail="Tidak ada user ditemukan")
+
+    ok = 0; fail = 0; blocked = 0
+    tg_url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+
+    async with httpx.AsyncClient(timeout=10) as client:
+        for uid in targets:
+            try:
+                resp = await client.post(tg_url, json={
+                    "chat_id":    uid,
+                    "text":       req.message,
+                    "parse_mode": req.parse_mode,
+                })
+                if resp.status_code == 200:
+                    ok += 1
+                else:
+                    body = resp.json()
+                    desc = body.get("description", "").lower()
+                    if "blocked" in desc or "bot was kicked" in desc:
+                        blocked += 1
+                    fail += 1
+            except Exception as e:
+                fail += 1
+            await asyncio.sleep(0.05)  # 20 msg/s Telegram rate limit
+
+    return {
+        "success":    True,
+        "total":      len(targets),
+        "sent":       ok,
+        "failed":     fail,
+        "blocked":    blocked,
+    }
+
+@app.post("/broadcast/photo", tags=["Broadcast"], summary="Kirim foto + caption ke semua / sebagian user")
+async def broadcast_photo(
+    photo:      str = Query(..., description="File ID Telegram atau URL foto"),
+    caption:    str = Query("", description="Caption foto (opsional)"),
+    parse_mode: str = Query("Markdown"),
+    target_ids: Optional[List[int]] = None,
+    _=Depends(admin_only)
+):
+    targets = target_ids if target_ids else get_all_user_ids()
+    if not targets:
+        raise HTTPException(status_code=404, detail="Tidak ada user ditemukan")
+
+    ok = 0; fail = 0; blocked = 0
+    tg_url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
+
+    async with httpx.AsyncClient(timeout=10) as client:
+        for uid in targets:
+            try:
+                payload = {"chat_id": uid, "photo": photo}
+                if caption:
+                    payload["caption"]    = caption
+                    payload["parse_mode"] = parse_mode
+                resp = await client.post(tg_url, json=payload)
+                if resp.status_code == 200:
+                    ok += 1
+                else:
+                    desc = resp.json().get("description", "").lower()
+                    if "blocked" in desc or "kicked" in desc:
+                        blocked += 1
+                    fail += 1
+            except:
+                fail += 1
+            await asyncio.sleep(0.05)
+
+    return {"success": True, "total": len(targets), "sent": ok, "failed": fail, "blocked": blocked}
+
+
+# ============================================================
+# ROUTES — IMAP / SERVER TEST
+# ============================================================
+
+@app.get("/imap/test", tags=["IMAP"], summary="Test koneksi IMAP Gmail")
+async def imap_test(_=Depends(admin_only)):
+    """Cek apakah koneksi IMAP ke Gmail bisa dibuat."""
+    loop   = asyncio.get_running_loop()
+    result = await loop.run_in_executor(None, _test_imap_connection)
+    if result["success"]:
+        return result
+    raise HTTPException(status_code=502, detail=result["error"])
+
+def _test_imap_connection() -> dict:
+    conn = None
+    try:
+        start = time.time()
+        conn  = imaplib.IMAP4_SSL(IMAP_SERVER, IMAP_PORT)
+        conn.login(GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
+        status, data = conn.select("INBOX", readonly=True)
+        elapsed = round(time.time() - start, 2)
+        msg_count = int(data[0]) if data and data[0] else 0
+        return {
+            "success":    True,
+            "server":     IMAP_SERVER,
+            "account":    GMAIL_ADDRESS,
+            "inbox_msgs": msg_count,
+            "latency_s":  elapsed,
+            "time_wib":   now_wib_str(),
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+    finally:
+        if conn:
+            try: conn.logout()
+            except: pass
+
+@app.get("/imap/scan", tags=["IMAP"], summary="Scan inbox untuk semua email aktif (trigger manual)")
+async def imap_scan(_=Depends(admin_only)):
+    """
+    Trigger scan IMAP untuk semua email yang sedang aktif di memory.
+    Hasilnya disimpan ke cache OTP.
+    """
+    with otp_lock:
+        active = list(email_owners.keys())
+
+    if not active:
+        return {"success": True, "scanned": 0, "found_otp": 0, "message": "Tidak ada email aktif"}
+
+    loop  = asyncio.get_running_loop()
+    found = await loop.run_in_executor(None, _scan_all_emails, active)
+
+    return {
+        "success":   True,
+        "scanned":   len(active),
+        "found_otp": found,
+        "time_wib":  now_wib_str(),
+    }
+
+def _scan_all_emails(targets: List[str]) -> int:
+    found = 0
+    conn  = None
+    try:
+        conn     = imaplib.IMAP4_SSL(IMAP_SERVER, IMAP_PORT)
+        conn.login(GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
+        date_str = now_wib().strftime("%d-%b-%Y")
+        folders  = ['INBOX', '"[Gmail]/All Mail"', '"[Gmail]/Spam"']
+
+        for target_email in targets:
+            for folder in folders:
+                try:
+                    status, _ = conn.select(folder, readonly=True)
+                    if status != "OK": continue
+                    _, data = conn.search(None, f'(TO "{target_email}" SINCE "{date_str}")')
+                    if not data or not data[0]: continue
+                    nums = data[0].split()
+                    for num in reversed(nums[-10:]):
+                        try:
+                            _, msg_data = conn.fetch(num, "(RFC822)")
+                            if not msg_data or not msg_data[0]: continue
+                            raw = msg_data[0]
+                            if not isinstance(raw, tuple) or len(raw) < 2: continue
+                            msg     = email.message_from_bytes(raw[1])
+                            subject = decode_str(msg.get("Subject", ""))
+                            body    = get_email_body(msg)
+                            otp     = extract_otp(body) or extract_otp(subject)
+                            if otp:
+                                em = target_email.lower()
+                                with otp_lock:
+                                    if em not in otp_history:
+                                        otp_history[em] = []
+                                    if otp not in otp_history[em]:
+                                        otp_history[em].append(otp)
+                                found += 1
+                                break
+                        except: continue
+                    if found > 0: break
+                except: continue
+            time.sleep(SCAN_BATCH_DELAY)
+    except Exception as e:
+        print(f"Scan error: {e}")
+    finally:
+        if conn:
+            try: conn.logout()
+            except: pass
+    return found
+
+
+# ============================================================
+# ROUTES — OTP CACHE (tambahan)
+# ============================================================
+
+@app.get("/otp/cache/all", tags=["OTP"], summary="Lihat semua OTP yang ada di cache memory")
+def get_all_otp_cache(_=Depends(admin_only)):
+    with otp_lock:
+        snapshot = {em: list(otps) for em, otps in otp_history.items()}
+    return {
+        "total_emails": len(snapshot),
+        "total_otps":   sum(len(v) for v in snapshot.values()),
+        "cache":        snapshot,
+    }
+
+@app.delete("/otp/cache/all", tags=["OTP"], summary="Bersihkan seluruh OTP cache memory")
+def clear_all_otp_cache(_=Depends(admin_only)):
+    with otp_lock:
+        count = len(otp_history)
+        otp_history.clear()
+        sent_otp_set.clear()
+    return {"success": True, "cleared_emails": count}
+
+
+# ============================================================
+# ROUTES — BOT STATS DETAIL
+# ============================================================
+
+@app.get("/stats/topup", tags=["Admin"], summary="Statistik topup detail")
+def stats_topup(
+    days: int = Query(7, ge=1, le=365, description="Rentang hari ke belakang"),
+    _=Depends(admin_only)
+):
+    since = (now_wib() - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+    with db() as conn:
+        total_row = conn.execute(
+            "SELECT COUNT(*), COALESCE(SUM(amount),0), COALESCE(SUM(slots),0), COALESCE(SUM(bonus),0) "
+            "FROM topup_orders WHERE status='SUCCESS' AND created_at >= ?", (since,)
+        ).fetchone()
+        pending = conn.execute(
+            "SELECT COUNT(*) FROM topup_orders WHERE status='PENDING' AND created_at >= ?", (since,)
+        ).fetchone()[0]
+        expired = conn.execute(
+            "SELECT COUNT(*) FROM topup_orders WHERE status='EXPIRED' AND created_at >= ?", (since,)
+        ).fetchone()[0]
+        # Per-day breakdown (last 7 days)
+        daily = conn.execute(
+            "SELECT DATE(created_at) as day, COUNT(*), SUM(amount) "
+            "FROM topup_orders WHERE status='SUCCESS' AND created_at >= ? "
+            "GROUP BY day ORDER BY day DESC",
+            (since,)
+        ).fetchall()
+    return {
+        "period_days":    days,
+        "since":          since,
+        "success": {
+            "count":       total_row[0],
+            "revenue":     int(total_row[1]),
+            "slots_sold":  int(total_row[2]),
+            "bonus_given": int(total_row[3]),
+        },
+        "pending":        pending,
+        "expired":        expired,
+        "daily_breakdown": [
+            {"date": r[0], "count": r[1], "revenue": int(r[2])}
+            for r in daily
+        ],
+    }
+
+@app.get("/stats/users", tags=["Admin"], summary="Statistik user detail")
+def stats_users(_=Depends(admin_only)):
+    with db() as conn:
+        total      = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        zero_slot  = conn.execute("SELECT COUNT(*) FROM users WHERE slots=0").fetchone()[0]
+        has_slot   = total - zero_slot
+        top10      = conn.execute(
+            "SELECT user_id, slots, email_count, otp_count FROM users ORDER BY otp_count DESC LIMIT 10"
+        ).fetchall()
+        total_otp  = conn.execute("SELECT COALESCE(SUM(otp_count),0) FROM users").fetchone()[0]
+        total_email= conn.execute("SELECT COALESCE(SUM(email_count),0) FROM users").fetchone()[0]
+    return {
+        "total_users":      total,
+        "users_with_slots": has_slot,
+        "users_no_slots":   zero_slot,
+        "total_otp_all":    total_otp,
+        "total_email_all":  total_email,
+        "active_sessions":  len(user_emails),
+        "top10_by_otp": [
+            {"rank": i+1, "user_id": r[0], "slots": r[1], "email_count": r[2], "otp_count": r[3]}
+            for i, r in enumerate(top10)
+        ],
+    }
+
+@app.get("/stats/slots", tags=["Admin"], summary="Statistik slot detail")
+def stats_slots(_=Depends(admin_only)):
+    current_wib_str = now_wib_str()
+    with db() as conn:
+        active_batches = conn.execute(
+            "SELECT COUNT(*), COALESCE(SUM(remaining),0) FROM slot_batches "
+            "WHERE remaining>0 AND (expired_at IS NULL OR expired_at > ?)",
+            (current_wib_str,)
+        ).fetchone()
+        expiring_soon = conn.execute(
+            "SELECT COUNT(*), COALESCE(SUM(remaining),0) FROM slot_batches "
+            "WHERE remaining>0 AND expired_at IS NOT NULL "
+            "AND expired_at > ? AND expired_at <= ?",
+            (current_wib_str, (now_wib() + timedelta(days=3)).strftime("%Y-%m-%d %H:%M:%S"))
+        ).fetchone()
+        by_source = conn.execute(
+            "SELECT source, COUNT(*), SUM(total), SUM(remaining) FROM slot_batches "
+            "WHERE remaining>0 GROUP BY source"
+        ).fetchall()
+    return {
+        "active_batches":   active_batches[0],
+        "total_remaining":  active_batches[1],
+        "expiring_in_3d":   {"batches": expiring_soon[0], "slots": expiring_soon[1]},
+        "by_source": [
+            {"source": r[0], "batches": r[1], "total_given": r[2], "remaining": r[3]}
+            for r in by_source
+        ],
+        "slot_expiry_days": SLOT_EXPIRY_DAYS,
+        "time_wib":         current_wib_str,
+    }
